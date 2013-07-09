@@ -1,0 +1,422 @@
+#!/usr/bin/python
+
+## Script to run the TANGO aggregation predictor
+## Alex Holehouse, Pappu Lab
+## Washington University in Saint Louis
+## alex.holehouse@wustl.edu
+## July 2013
+##
+##
+
+
+import argparse   
+import sys
+import re
+import time
+import shlex
+import subprocess as sub
+from subprocess import call
+
+import os
+
+
+## GLOBAL CONSTANTS
+## 
+SUMMARY_FILE            = "SUMMARY.txt"
+DEFAULT_CONDITIONS      = {'default':' ct="N" nt="N" ph="7.2" te="303" io="0.02"','acidic':' ct="N" nt="N" ph="5.0" te="303" io="0.1"'}
+OUTPUT_DIRECTORY        = "pyTANGO_OUT"
+CONDITIONS_FILE         = "TANGO_conditions_file.tng"
+
+
+localtime = time.asctime( time.localtime(time.time()) )
+
+## ====================================================================================================================================
+
+
+
+## --------------------------------------------------------------------------
+## function to extract protein sequences for a file
+## 
+## file types supported
+##   FASTA 
+##   space seperated variable (one per line)
+##   comma seperated variable (one per line)
+##   Raw sequence (one per line)
+##
+
+
+def extract_sequence(rawfile_list):
+   
+
+   # In a perfect word all the IDs would be unique
+   # however, this code relies on the file input IDs being
+   # unique, but that is an implementation left up to the user, which
+   # may or may not be possible/correct.
+   #
+   # To accomodate this, pyTANGO uses an internally independent mapping 
+   # of numbers for IDs, such that nameMapping maps the internal ID to 
+   # the provided ID, and sequenceMapping maps the internal ID to the
+   # sequence. This means we can be certain to avoid overwrites
+
+   nameMapping = {}
+   sequenceMapping = {}
+   ID=0
+   
+   # Check if we have a fasta file. FASTA file headers come in all shapes
+   # and sizes. While initially I worked on trying to allow for parsing of IDs
+   # from within the header, this has proved impossible due to the lack of standard
+   # placement of unique IDs in the header
+   #
+   # As a result, the approach now taken is to
+   # 1) Treat uniprot/swissprot headed FASTA files uniquely and correctly
+   # 2) For others we strip out non alphanumeric characters and whitespace
+   #    and then iterate over each element in that string divided by whitespace
+   #    until a long enough string is built
+   #
+   #
+   if re.search('\A>', rawfile_list[0]):
+         
+      currentSeq = ""
+      currentName = ""
+      
+      for line in rawfile_list:
+         if re.search('\A>', line):
+            if not currentSeq == "":
+               sequenceMapping[ID]=process_sequence(currentSeq)
+               nameMapping[ID]=currentName
+               ID=ID+1
+            currentSeq=""
+
+            # re-write this so currentName becomes the first string after >
+            currentName=process_header(line)
+         else:
+            currentSeq= "".join([currentSeq, line.strip()])
+
+      # final sequence addition
+      sequenceMapping[ID]=process_sequence(currentSeq)
+      nameMapping[ID]=currentName
+            
+   ## Next we check for basic sequence store - i.e. 'name sequence'
+   elif rawfile_list[0].find(" "):
+      for line in rawfile_list:
+         splitline = line.split(" ")
+
+         sequenceMapping[ID]=process_sequence(splitline[1].strip())
+         nameMapping[ID]=splitline[0]
+         ID=ID+1
+
+   # Next CSV (ID,SEQUENCE)
+   elif rawfile_list[0].count(",") == 1:
+      splitline = line.split(",")
+      
+      sequenceMapping[ID]=process_sequence(splitline[1].strip())
+      nameMapping[ID]=splitline[0]
+      ID=ID+1
+
+   # Finally, we gobbel up each line and represent each line as a seperate
+   # sequence, with an identifier relative to the sequence position
+   else:
+
+      for line in rawfile_list:
+         sequenceMapping[ID]=process_sequence(line)
+         nameMapping[ID]=ID
+         ID=ID+1
+      
+         
+   return (sequenceMapping, nameMapping)
+
+## --------------------------------------------------------------------------\
+## Function to extract meaning from a FASTA header
+##
+##
+def process_header(HD):
+   """Function to extract relevant and non pathalogical names from a
+      fasta header
+   """
+   
+   # uniprot/swissprot
+   if re.search('\A>', HD) and re.search('\|.*\|', HD):
+      name=line.split(">")[1].split("|")[1]
+      
+   # else lets hope to God that whoever created the header created some amount
+   # of identifying information early on...
+   else:
+      # remove any weird characters which will mess up filenames
+      HD = re.sub(r'[^a-zA-Z0-9 ]', '', HD)
+      
+      goodEnough=False
+      combined=1
+      while not goodEnough:
+         tempName=""
+         nameList = HD.split(" ")
+         for i in xrange(0,combined):
+            if i == 0:
+               tempName = nameList[i]
+            else:
+               tempName = "".join([tempName,"_", nameList[i]])
+         if len(tempName) > 5:
+            goodEnough=True
+         else:
+            combined=combined+1
+            if combined > len(nameList):
+               goodEnough=True
+
+      name=tempName
+   return name
+
+## --------------------------------------------------------------------------\
+## Function to clean up sequence files
+##
+##
+def process_sequence(seq):
+   """ Takes an unsanitized string and returns a valid protein sequence string"""
+   return re.sub(r'[^acdefghiklmnopqrstvwyzACDEFGHIKLMNOPQRSTVWYZ]', '', seq)
+      
+
+         
+## --------------------------------------------------------------------------
+## Function to read an input file 
+##
+##
+##
+def build_new_inputfile(sequenceFilename, conditions, filename, writeToFile=True):
+   """Function which takes a sequence filename, conditions type, and output filename, 
+      and returns two dictionaries;
+
+      runDict -  A dictionary of commands which can be run by TANGO, indexed by
+                 guarenteed unique IDs to avoid hash collisions
+      nameDict - A dictionary of input derived names, mapped to those unique
+                 IDs used for the runDict
+   """
+
+   # runDict will contain a dictionary of runable comands
+   runDict = {}
+
+   if not args.seq:      
+      print "\n--> ERROR!: No sequence file provided\n\n"
+      exit(1)
+
+   if not args.conditions in DEFAULT_CONDITIONS:
+      print "\n--> ERROR!: Currently only supports pre-defined conditions\n\n"
+      exit(1)
+
+   # Open and read in the file
+   try:
+      with open(args.seq) as f:
+         content = f.readlines()
+   except IOError as e:
+      print "\n--> ERROR!: Unable to open file [ {0} ]\n\
+            (error: {1}\n".format(args.seq, e.message)
+      exit(1)
+
+
+   # Parse the file (get the cleaned sequence and a name)
+   try:
+      (seqMap, nameMap) = extract_sequence(content)
+   except Exception as e:
+      print e
+      print "\n--> ERROR!: Unable to parse file data [ {0} ]\n\
+            (error): {1}\n".format(args.seq,  e.message)
+      exit(1)
+
+
+   # Build a dictionary of runable TANGO commands
+   for ID in seqMap:
+      runDict[ID] = nameMap[ID] + DEFAULT_CONDITIONS[args.conditions] + ' seq="' + seqMap[ID] +'"'
+   
+
+   # If write to file ste to True then write to file
+   # else return the runanble command 
+   if writeToFile:
+      with open(filename, 'w') as f:
+         for i in runDict:
+            f.write(runDict[i])
+      return runDict
+   else:
+      return (runDict, nameMap)
+
+## --------------------------------------------------------------------------
+## Function which runs the TANGO binary using the dictionary of run commands
+## and deals with the output
+##
+
+
+def runTango(runDict, nameMap, readFile=True):
+   fileout = {}
+
+   for i in runDict:
+      command = "tango_x86_64_release " + runDict[i]
+
+      print command 
+
+      output = sub.Popen(command, stdout=sub.PIPE, stderr=sub.PIPE, shell=True)
+      stout, sterr = output.communicate()
+      fileout[i] = stout
+
+   with open(SUMMARY_FILE, 'w') as fh:
+      print "+========================================================================+"
+      print "Writing summary to {0}".format(SUMMARY_FILE)       
+      for i in fileout:
+         fh.write(str(i) + nameMap[i] + ' ' + fileout[i])
+
+
+
+## ===================================================================================================
+##                              Main Script - hold onto your hat!
+## ===================================================================================================
+
+if __name__=="__main__":
+
+
+   print "+========================================================================+"
+   print "| TANGO - A computer algorithm for prediction of aggregating regions in  |"
+   print "|                   unfolded polypeptide chains                          |"
+   print "+------------------------------------------------------------------------+"
+   print "|                                                                        |" 
+   print "| "+localtime + "                                               |"
+   print "|                                                                        |" 
+   print "| Please cite:                                                           |\n|\
+   Fernandez-Escamilla AM, Rousseau F, Schymkowitz J, Serrano L (2004)  |\n|\
+   Prediction of sequence-dependent and mutational effects on the       |\n|\
+   aggregation of peptides and proteins. Nat Biotechnol 22: 1302-1306   |"
+   print "|                                                                        |" 
+   print "+------------------------------------------------------------------------+"
+   print "| pyTANGO v.1.1                                                          |" 
+   print "+------------------------------------------------------------------------+"
+   print "|                                                                        |" 
+   print "| For help relating to the TANGO program see http://tango.crg.es         |"          
+   print "| For bug fixes relating to pyTANGO contact alex.holehouse@wustl.edu     |"
+   print "|                                                                        |" 
+   print "+========================================================================+\n"
+   print "Example: pyTANGO -c default -s inputFile.fasta                          \n\n"
+   print "Input files can be"
+   print "                   -> FASTA"
+   print "                   -> csv ('name,sequence' - one per line)"
+   print "                   -> space seperated variable ('name sequence' - one"
+   print "                      per line)"
+   print "                   -> one sequence per line\n"
+   print "For for information try: pyTANGO --man"
+   print "+========================================================================+\n"
+
+
+   parser = argparse.ArgumentParser()
+   parser.add_argument("--conditions", "-c", help="Set the predefined conditions for the run.") 
+   
+   parser.add_argument("--seq","-s", help="File which contains sequences to be used for input") 
+   
+   parser.add_argument("--write-conditions","-w", help="Write full conditions file to 'TANGO_conditions_file.tng'", action="store_true") 
+   
+   parser.add_argument("--list-conditions", "-lc", help="List the available conditions which can be provided for the -c flag", action="store_true")
+
+   parser.add_argument("--man", "-m", help="Print the pyTANGO manual", action="store_true")
+
+
+
+   args = parser.parse_args()
+
+## List mode
+# List the predefined conditions and exit
+#  
+   if args.list_conditions:
+      print "Default conditions below:"
+      for i in DEFAULT_CONDITIONS:
+         print i + ":" + DEFAULT_CONDITIONS[i]
+      exit(0)
+
+## Man mode
+# Print the manual and exit
+#  
+
+   if args.man:
+      print ".........................................................................."
+      print " INTRODUCTION\n"
+      print " pyTANGO provides a nice *NIX friendly command line wrapper around the TANGO"
+      print " aggregation prediction algorithm. For information on TANGO in general go "
+      print " to http://tango.crg.es/ . Note that pyTANGO is not affiliated with TANGO\n"
+      print ".........................................................................."
+      print " INPUT AND OUTPUT\n"
+      print " pyTANGO accepts a range of file input types, as noted above, and outputs both"
+      print " residue specific and general sequence information into an autogenerated"
+      print " directory called '{0}', which is created in the directory you run".format(OUTPUT_DIRECTORY)
+      print " the command from. This directory has\n"
+      print "   1) One file per sequence analysed, which considers each residues' "
+      print "      aggregation propensity"
+      print "   2) One summary file, called '{0}' which contains summary".format(SUMMARY_FILE)
+      print "      information for each sequence"
+      print ""
+      print " For future reference, you can also print the TANGO commands used to carry"
+      print " out the analysis by including the '-w' flag. This will lead to an "
+      print " additional file being generated in the '{0}' directory called ".format(OUTPUT_DIRECTORY)
+      print " '{0}'\n".format(CONDITIONS_FILE)
+      print ".........................................................................."
+      print " CONDITIONS\n"
+      print " Right now, you can only run the program using predefined conditions."
+      print " To print these conditions out simply run either"
+      print "    pyTANGO -lc "
+      print "    pyTANGO --list-conditions "
+      print " The default conditions are\n" 
+      print "    default: ct=\"N\" nt=\"N\" ph=\"7.2\" te=\"303\" io=\"0.02\"\n"
+      print " Which mean "
+      print "  ct    = C terminal"
+      print '          Can be "N" (free) or "Y" (amidated)'
+      print "  nt    = N terminal"
+      print '          Can be "N" (free) or "A" (acetylated) or "S" (succinilated)'
+      print "  ph    = pH"
+      print "  te    = temperature in Kelvin"
+      print "  io    = ionic strength of solution in M\n\n"
+      print ".........................................................................."
+      print " LICENSE\n"
+      print " The MIT License (MIT)\n Copyright (c) 2013 Alex Holehouse\n\n \
+Permission is hereby granted, free of charge, to any person obtaining a copy\n \
+of this software and associated documentation files (the \"Software\"), to deal\n \
+in the Software without restriction, including without limitation the rights\n \
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n \
+copies of the Software, and to permit persons to whom the Software is\n \
+furnished to do so, subject to the following conditions:\n\n \
+The above copyright notice and this permission notice shall be included in\n\
+ all copies or substantial portions of the Software.\n\n \
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n\
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n\
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n\
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n\
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n\
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN\n\
+ THE SOFTWARE.\n\n"
+      
+      exit(0)
+
+
+
+## RUN mode
+# Analyse the sequences in a file, generating output to the
+# OUTPUT_DIRECTORY
+   if args.conditions and args.seq:
+      print "--> Running TANGO on file {0}".format(args.seq)
+      print "+========================================================================+"
+
+      ## create output directory
+      if not os.path.exists(OUTPUT_DIRECTORY):
+         os.makedirs(OUTPUT_DIRECTORY)
+
+      try:
+         os.chdir(OUTPUT_DIRECTORY)
+      except OSError as exception:
+         "\n--> ERROR!: Problem when creating output directiory - do you have file permission\nerror: {0}".format(exception.message)
+         exit(1)
+         
+
+      print os.getcwd()
+
+      args.seq = "".join(["../",args.seq])
+      #exit(0)
+    
+      if args.write_conditions:
+         (inputDict, nameMap) = build_new_inputfile(args.seq, args.conditions, CONDITIONS_FILE, True)
+         print "--> Wrote full conditions file to".format(filename)
+      else:
+         (inputDict, nameMap) = build_new_inputfile(args.seq, args.conditions, CONDITIONS_FILE, False)
+
+      runTango(inputDict, nameMap, False)   
+
+
+   
