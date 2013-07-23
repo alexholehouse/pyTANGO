@@ -23,7 +23,7 @@ import os
 ## GLOBAL CONSTANTS
 ## 
 SUMMARY_FILE            = "SUMMARY.txt"
-DEFAULT_CONDITIONS      = {'default':' ct="N" nt="N" ph="7.2" te="303" io="0.02"','acidic':' ct="N" nt="N" ph="5.0" te="303" io="0.1"'}
+DEFAULT_CONDITIONS      = {'default':' ct="N" nt="N" ph="7" te="298.15" io="0.02"','acidic':' ct="N" nt="N" ph="5.0" te="298" io="0.1"'}
 OUTPUT_DIRECTORY        = "pyTANGO_OUT"
 CONDITIONS_FILE         = "TANGO_conditions_file.tng"
 
@@ -107,11 +107,12 @@ def extract_sequence(rawfile_list):
 
    # Next CSV (ID,SEQUENCE)
    elif rawfile_list[0].count(",") == 1:
-      splitline = line.split(",")
+      for line in rawfile_list:
+         splitline = line.split(",")
       
-      sequenceMapping[ID]=process_sequence(splitline[1].strip())
-      nameMapping[ID]=splitline[0]
-      ID=ID+1
+         sequenceMapping[ID]=process_sequence(splitline[1].strip())
+         nameMapping[ID]=splitline[0]
+         ID=ID+1
 
    # Finally, we gobbel up each line and represent each line as a seperate
    # sequence, with an identifier relative to the sequence position
@@ -136,7 +137,7 @@ def process_header(HD):
    
    # uniprot/swissprot
    if re.search('\A>', HD) and re.search('\|.*\|', HD):
-      name=line.split(">")[1].split("|")[1]
+      name=HD.split(">")[1].split("|")[1]
       
    # else lets hope to God that whoever created the header created some amount
    # of identifying information early on...
